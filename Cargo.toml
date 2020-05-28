@@ -1,0 +1,19 @@
+[package]
+name = "udptun"
+description = "Tool for tunneling/port forwarding UDP servers."
+version = "0.1.0"
+authors = ["2xsaiko <git@dblsaiko.net>"]
+edition = "2018"
+
+[profile.release]
+lto = true
+
+[dependencies]
+clap = "3.0.0-beta.1"
+tokio = { version = "0.2.21", features = ["full", "udp"] }
+chrono = "0.4.11"
+rand = "0.7.3"
+num-traits = "0.2.11"
+thiserror = "1.0.19"
+itertools = "0.9.0"
+net2 = "0.2.34"

@@ -1,0 +1,6 @@
+Does not accept connections from 172.x.x.x/localhost
+
+WORKS with:
+    udptun -l 0.0.0.0:5199 -E 0.0.0.0:5198
+    udptun --source-format 172.18.19.29:0 -T 172.18.19.6:5198 -r 144.76.197.75:5199
+on non-host computer (2 computers needed)
