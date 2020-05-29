@@ -570,7 +570,6 @@ dependencies = [
  "chrono",
  "clap",
  "itertools",
- "net2",
  "num-traits",
  "rand",
  "thiserror",

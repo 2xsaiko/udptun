@@ -1,70 +1,103 @@
 use std::{fmt, io};
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::task::Poll;
+use std::net::SocketAddr;
 
 use chrono::Duration;
 use rand::prelude::{SliceRandom, ThreadRng};
-use rand::Rng;
-use tokio::future::poll_fn;
-use tokio::net::UdpSocket;
+use tokio::net::{ToSocketAddrs, UdpSocket};
 
-use crate::{PACKET_CONN_ACK, PACKET_CONNECT, PACKET_DATA, TYPE_CLIENT, TYPE_SERVER};
+use crate::{common, output};
+use crate::common::{default_listen_ip, Format, IpMode, respond_connect, setup_tunnel_socket};
+use crate::output::Alignment;
+use crate::proto::*;
 use crate::server_cache::{Cache, CacheEntry};
 use crate::sourcefmt::SourceFormat;
 
-pub async fn start_server(target: SocketAddr, remote: Option<SocketAddr>, bufsize: usize, timeout: Duration, tunnel_addr: Option<SocketAddr>, source_format: Option<SourceFormat>, verbosity: u64) {
-    let mut buffer = vec![0; bufsize];
+pub struct ServerParams<'a, T, U, V>
+    where T: ToSocketAddrs,
+          U: ToSocketAddrs,
+          V: ToSocketAddrs {
+    pub target: T,
+    pub remote: Option<U>,
+    pub bufsize: usize,
+    pub timeout: Duration,
+    pub tunnel_addr: Option<V>,
+    pub source_format: Option<SourceFormat>,
+    pub mode: IpMode,
+    pub format: Option<Format<'a>>,
+    pub print_data_buffer: bool,
+}
 
-    let mut tunnel_socket = UdpSocket::bind(crate::select_addr_or_default_by(tunnel_addr, || remote.unwrap())).await.unwrap();
-    if let Some(remote) = remote {
-        tunnel_socket.connect(remote).await.unwrap();
-    }
-    if tunnel_addr.is_none() {
-        crate::connect(&mut tunnel_socket, &mut buffer, TYPE_CLIENT).await;
-    }
-
-    let mut cache: Cache = Cache::new(timeout);
+pub async fn start_server<T, U, V>(params: ServerParams<'_, T, U, V>)
+    where T: ToSocketAddrs,
+          U: ToSocketAddrs,
+          V: ToSocketAddrs {
+    let mut buffer = vec![0; params.bufsize];
+    let mut tunnel_socket = setup_tunnel_socket(params.tunnel_addr, params.remote, params.mode, &mut buffer, TYPE_CLIENT).await;
+    let mut cache: Cache = Cache::new(params.timeout);
+    let data_table = params.format.map(|f| output::Table::<OutputColumn>::parse_spec(f.with_default("[%d tunnel] client: %c lsock: %a dbuf: %l")).unwrap());
 
     loop {
         match poll_sockets(&tunnel_socket, &cache, &mut buffer[2..]).await {
-            (dir, Ok((size, source_addr))) => {
+            (dir, Ok((size, sender_addr))) => {
                 match dir {
                     Direction::FromTunnel => {
                         let buffer = &mut buffer[2..];
                         if size == 0 { continue; }
                         match buffer[0] {
                             PACKET_CONNECT => {
-                                buffer[0] = PACKET_CONN_ACK;
-                                buffer[1] = TYPE_SERVER;
-                                buffer[2] = 0x01; // version
-                                tunnel_socket.connect(source_addr).await.unwrap();
-                                tunnel_socket.send(&buffer[..3]).await.unwrap();
+                                respond_connect(&mut tunnel_socket, sender_addr, buffer, TYPE_SERVER).await;
                             }
                             PACKET_DATA => {
                                 let buffer = &mut buffer[..size];
                                 if buffer.len() < 2 {
-                                    eprintln!("packet from {} too small for data, ignoring", source_addr);
+                                    eprintln!("packet from {} too small for data, ignoring", sender_addr);
                                     continue;
                                 }
-                                let id = ConnId { from: source_addr, cid: buffer[1] };
-                                println!("relaying packet from {}", id);
+                                let id = ConnId { from: sender_addr, cid: buffer[1] };
                                 let socket = if let Some(CacheEntry { socket, .. }) = cache.get_by_id_mut(id) {
                                     socket
                                 } else {
-                                    &mut cache.insert(id, create_socket(target, &source_format).await).socket
+                                    match create_socket(&params.target, &params.source_format, params.mode).await {
+                                        Ok(s) => &mut cache.insert(id, s).socket,
+                                        Err(e) => {
+                                            eprintln!("failed to open client socket: {}", e);
+                                            continue;
+                                        }
+                                    }
                                 };
-                                println!("sending {} bytes to {}", buffer.len() - 2, target);
-                                socket.send_to(&buffer[2..], target).await.unwrap();
+                                if let Some(data_table) = &data_table {
+                                    let info = DataPacketInfo {
+                                        to_tunnel: false,
+                                        client: id,
+                                        tunnel_socket: socket.local_addr().ok(),
+                                        data_len: buffer.len() - 2,
+                                    };
+                                    println!("{}", data_table.bind(&info));
+                                }
+                                if let Err(e) = socket.send(&buffer[2..]).await {
+                                    eprintln!("failed to send packet: {}", e);
+                                }
                             }
-                            _ => eprintln!("ignoring invalid packet type ${:02X}", buffer[0])
+                            _ => eprintln!("ignoring invalid packet type ${:02X} from {}", buffer[0], sender_addr)
                         }
                     }
                     Direction::IntoTunnel(id) => {
                         buffer[0] = PACKET_DATA;
                         buffer[1] = id.cid;
-                        println!("relaying packet from target server to {}, through {}", id, id.from);
-                        tunnel_socket.send_to(&buffer[..size + 2], id.from).await.unwrap();
+                        if let Some(data_table) = &data_table {
+                            let info = DataPacketInfo {
+                                to_tunnel: true,
+                                client: id,
+                                tunnel_socket: cache.get_by_id_mut(id).and_then(|s| s.socket.local_addr().ok()),
+                                data_len: size,
+                            };
+                            println!("{}", data_table.bind(&info));
+                        }
+                        if let Err(e) = tunnel_socket.send(&buffer[..size + 2]).await {
+                            eprintln!("failed to send packet: {}", e);
+                        }
                     }
                 }
             }
@@ -81,12 +114,8 @@ async fn poll_sockets(tunnel_socket: &UdpSocket, cache: &Cache, buf: &mut [u8]) 
     all.extend(cache.iter().map(|e| (Direction::IntoTunnel(e.id), &e.socket)));
     all.shuffle(&mut ThreadRng::default());
 
-    poll_fn(|cx| {
-        all.iter().filter_map(|&(dir, sock)| match sock.poll_recv_from(cx, buf) {
-            Poll::Ready(r) => Some((dir, r)),
-            Poll::Pending => None,
-        }).next().map(Poll::Ready).unwrap_or(Poll::Pending)
-    }).await
+    let (d, r) = common::poll_sockets(&all, buf).await;
+    (*d, r)
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -102,13 +131,13 @@ enum Direction {
 }
 
 impl Display for ConnId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}@{}", self.cid, self.from)
     }
 }
 
 impl Display for Direction {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
             Direction::FromTunnel => write!(f, "tunnel"),
             Direction::IntoTunnel(id) => write!(f, "target (connection from {})", id),
@@ -116,29 +145,68 @@ impl Display for Direction {
     }
 }
 
-async fn create_socket(target: SocketAddr, sf: &Option<SourceFormat>) -> UdpSocket {
-    let a = if let Some(sf) = sf {
-        sf.get_addr(ThreadRng::default())
-    } else {
-        crate::get_ip_version_default_addr(target)
-    };
-    println!("Creating socket on {}", a);
-    let socket = fuck_you::create(a).unwrap();
-    // socket.connect(target).await.unwrap();
-    socket
+async fn create_socket(target: impl ToSocketAddrs, sf: &Option<SourceFormat>, mode: IpMode) -> io::Result<UdpSocket> {
+    let a = sf.map(|sf| sf.get_addr(ThreadRng::default())).unwrap_or_else(|| default_listen_ip(mode));
+    println!("creating socket on {}", a);
+    let socket = UdpSocket::bind(a).await?;
+    socket.connect(target).await.unwrap();
+    Ok(socket)
 }
 
-mod fuck_you {
-    use std::io;
-    use std::net::SocketAddr;
+struct DataPacketInfo {
+    to_tunnel: bool,
+    client: ConnId,
+    tunnel_socket: Option<SocketAddr>,
+    data_len: usize,
+}
 
-    use net2::{UdpBuilder, unix::UnixUdpBuilderExt};
+#[derive(Hash, Eq, PartialEq, Copy, Clone)]
+enum OutputColumn {
+    Direction,
+    RevDirection,
+    Client,
+    ClientId,
+    Peer,
+    TunnelSocket,
+    DataLen,
+}
 
-    pub(crate) fn create(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
-        let socket = (if addr.is_ipv4() { UdpBuilder::new_v4()? } else { UdpBuilder::new_v6()? })
-            .reuse_address(true)?
-            .reuse_port(true)?
-            .bind(addr)?;
-        tokio::net::UdpSocket::from_std(socket)
+impl output::Column for OutputColumn {
+    type Data = DataPacketInfo;
+
+    fn by_char(ch: char) -> Option<Self> {
+        match ch {
+            'd' => Some(OutputColumn::Direction),
+            'D' => Some(OutputColumn::RevDirection),
+            'c' => Some(OutputColumn::Client),
+            'i' => Some(OutputColumn::ClientId),
+            'p' => Some(OutputColumn::Peer),
+            'a' => Some(OutputColumn::TunnelSocket),
+            'l' => Some(OutputColumn::DataLen),
+            _ => None,
+        }
+    }
+
+    fn to_string<'a>(&'a self, data: &'a Self::Data) -> Cow<'a, str> {
+        match self {
+            OutputColumn::Direction => if data.to_tunnel { "=>" } else { "<=" }.into(),
+            OutputColumn::RevDirection => if data.to_tunnel { "<=" } else { "=>" }.into(),
+            OutputColumn::Client => format!("{}", data.client).into(),
+            OutputColumn::ClientId => format!("{}", data.client.cid).into(),
+            OutputColumn::Peer => format!("{}", data.client.from).into(),
+            OutputColumn::TunnelSocket => if let Some(s) = data.tunnel_socket { format!("{}", s).into() } else { "???".into() },
+            OutputColumn::DataLen => format!("{}", data.data_len).into(),
+        }
+    }
+
+    fn constant_size(&self) -> bool {
+        *self == OutputColumn::Direction
+    }
+
+    fn alignment(&self) -> Alignment {
+        match self {
+            OutputColumn::ClientId | OutputColumn::DataLen => Alignment::Right,
+            _ => Alignment::Left
+        }
     }
 }
