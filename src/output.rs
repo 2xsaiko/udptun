@@ -8,15 +8,15 @@ use std::hash::Hash;
 
 use thiserror::Error;
 
-pub struct Table<T> {
+pub struct TableFormat<T> {
     sizes: RefCell<HashMap<T, usize>>,
     format: Vec<FormatPart<T>>,
 }
 
-impl<T, D> Table<T>
+impl<T, D> TableFormat<T>
     where T: Column<Data=D> + Copy {
     fn new(format: Vec<FormatPart<T>>) -> Self {
-        Table { sizes: Default::default(), format }
+        TableFormat { sizes: Default::default(), format }
     }
 
     pub fn parse_spec(s: &str) -> Result<Self, ParseError> {
@@ -38,7 +38,7 @@ impl<T, D> Table<T>
         }
         partial.push_str(rem);
         parts.push(FormatPart::Literal(partial.to_string()));
-        Ok(Table::new(parts))
+        Ok(TableFormat::new(parts))
     }
 
     pub fn bind<'a>(&'a self, row: &'a D) -> BoundTable<'a, T> {
@@ -52,7 +52,7 @@ impl<T, D> Table<T>
 
 pub struct BoundTable<'a, T>
     where T: Column {
-    table: &'a Table<T>,
+    table: &'a TableFormat<T>,
     data: &'a T::Data,
 }
 
@@ -88,9 +88,9 @@ impl<T> Display for BoundTable<'_, T>
 
 #[derive(Error, Debug, Copy, Clone)]
 pub enum ParseError {
-    #[error("Invalid format spec")]
+    #[error("invalid format spec %{0}")]
     InvalidPart(char),
-    #[error("Unexpected end of format string")]
+    #[error("unexpected end of format string")]
     Eof,
 }
 

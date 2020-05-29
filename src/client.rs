@@ -32,10 +32,10 @@ pub async fn start_client<T, U, V>(params: ClientParams<'_, T, U, V>)
           U: ToSocketAddrs,
           V: ToSocketAddrs {
     let mut buffer = vec![0; params.bufsize];
-    let mut external_socket = UdpSocket::bind(params.entry).await.unwrap();
-    let mut tunnel_socket = setup_tunnel_socket(params.tunnel_addr, params.remote, params.mode, &mut buffer, TYPE_SERVER).await;
+    let mut external_socket = UdpSocket::bind(params.entry).await.expect("failed to open entry socket");
+    let mut tunnel_socket = setup_tunnel_socket(params.tunnel_addr, params.remote, params.mode, &mut buffer, TYPE_SERVER).await.expect("failed to setup tunnel");
     let mut cache = Cache::new(params.timeout);
-    let data_table = params.format.map(|f| output::Table::<OutputColumn>::parse_spec(f.with_default("[tunnel %D] client: %C cid: %i dbuf: %l")).unwrap());
+    let data_output = params.format.map(|f| output::TableFormat::<OutputColumn>::parse_spec(f.with_default("[tunnel %D] client: %C cid: %i dbuf: %l")).expect("failed to parse data log format"));
 
     loop {
         match poll_sockets(&tunnel_socket, &external_socket, &mut buffer[2..]).await {
@@ -52,7 +52,7 @@ pub async fn start_client<T, U, V>(params: ClientParams<'_, T, U, V>)
                                 let id = buffer[1];
                                 let buffer = &mut buffer[2..size];
                                 if let Some(SocketId { addr, .. }) = cache.get_by_id(id) {
-                                    if let Some(data_table) = &data_table {
+                                    if let Some(data_table) = &data_output {
                                         let data = DataPacketInfo {
                                             to_tunnel: false,
                                             client: addr,
@@ -73,10 +73,17 @@ pub async fn start_client<T, U, V>(params: ClientParams<'_, T, U, V>)
                         }
                     }
                     Direction::IntoTunnel => {
-                        let id = cache.get_or_insert_by_addr(sender_addr).unwrap().id;
+                        let cache_entry = match cache.get_or_insert_by_addr(sender_addr) {
+                            Ok(socket_id) => socket_id,
+                            Err(e) => {
+                                eprintln!("failed to get ID for client, ignoring: {}", e);
+                                continue;
+                            }
+                        };
+                        let id = cache_entry.id;
                         buffer[0] = PACKET_DATA;
                         buffer[1] = id;
-                        if let Some(data_table) = &data_table {
+                        if let Some(data_table) = &data_output {
                             let data = DataPacketInfo {
                                 to_tunnel: true,
                                 client: sender_addr,

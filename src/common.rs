@@ -1,38 +1,83 @@
+use std::fmt::{Display, Formatter};
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::ops::Deref;
 use std::task::Poll;
 
-use itertools::Itertools;
+use thiserror::Error;
 use tokio::future::poll_fn;
 use tokio::io;
 use tokio::net::{ToSocketAddrs, UdpSocket};
 
 use crate::proto::*;
 
-pub async fn setup_tunnel_socket(tunnel_addr: Option<impl ToSocketAddrs>, remote: Option<impl ToSocketAddrs>, mode: IpMode, buffer: &mut [u8], remote_type: u8) -> UdpSocket {
+pub async fn setup_tunnel_socket(tunnel_addr: Option<impl ToSocketAddrs>, remote: Option<impl ToSocketAddrs>, mode: IpMode, buffer: &mut [u8], remote_type: u8) -> Result<UdpSocket, Error> {
     let mut tunnel_socket = if let Some(tunnel_addr) = &tunnel_addr {
         UdpSocket::bind(tunnel_addr).await
     } else {
         UdpSocket::bind(default_listen_ip(mode)).await
-    }.expect("failed to bind to tunnel socket");
+    }.map_err(Error::TunnelSocketBind)?;
     if let Some(remote) = remote {
-        tunnel_socket.connect(remote).await.expect("failed to connect to remote");
+        tunnel_socket.connect(remote).await.map_err(Error::RemoteConnect)?;
     }
     if tunnel_addr.is_none() {
-        send_connect(&mut tunnel_socket, buffer, remote_type).await;
+        send_connect(&mut tunnel_socket, buffer, remote_type).await?;
     }
-    tunnel_socket
+    Ok(tunnel_socket)
 }
 
-pub async fn send_connect(tunnel_socket: &mut UdpSocket, buffer: &mut [u8], remote_type: u8) {
+pub async fn send_connect(tunnel_socket: &mut UdpSocket, buffer: &mut [u8], remote_type: u8) -> Result<(), Error> {
     buffer[0] = PACKET_CONNECT;
-    tunnel_socket.send(&buffer[..1]).await.expect("failed to send connect packet");
-    let len = tunnel_socket.recv(buffer).await.expect("failed to receive connect response");
+    tunnel_socket.send(&buffer[..1]).await.map_err(Error::ConnectSend)?;
+    let len = tunnel_socket.recv(buffer).await.map_err(Error::ConnectRecv)?;
     let expected = [PACKET_CONN_ACK, remote_type, 0x01];
     if buffer[..len] != expected {
-        eprintln!("remote sent invalid response to connect: {}, expected {}",
-                  buffer[..len].iter().map(|b| format!("{:02X}", b)).join(" "),
-                  expected.iter().map(|b| format!("{:02X}", b)).join(" "));
-        std::process::exit(2);
+        return Err(Error::ConnectResponse {
+            response: HexFormat(buffer[..len].into()),
+            expected: HexFormat(expected),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("failed to bind tunnel socket")]
+    TunnelSocketBind(#[source] io::Error),
+    #[error("failed to connect to remote")]
+    RemoteConnect(#[source] io::Error),
+    #[error("failed to send connect packet")]
+    ConnectSend(#[source] io::Error),
+    #[error("failed to receive connect response")]
+    ConnectRecv(#[source] io::Error),
+    #[error("remote sent invalid response to connect: {response}, expected {expected}")]
+    ConnectResponse { response: HexFormat<Vec<u8>>, expected: HexFormat<[u8; 3]> },
+}
+
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
+pub struct HexFormat<T>(T);
+
+impl<T> HexFormat<T> {
+    pub fn into_inner(self) -> T { self.0 }
+}
+
+impl<T> Deref for HexFormat<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<T> Display for HexFormat<T>
+    where for<'a> &'a T: IntoIterator<Item=&'a u8> {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut iter = self.into_iter();
+        if let Some(e) = iter.next() {
+            write!(f, "{:02X}", e)?;
+        }
+        for e in iter {
+            write!(f, " {:02X}", e)?;
+        }
+        Ok(())
     }
 }
 

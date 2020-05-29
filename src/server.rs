@@ -34,9 +34,9 @@ pub async fn start_server<T, U, V>(params: ServerParams<'_, T, U, V>)
           U: ToSocketAddrs,
           V: ToSocketAddrs {
     let mut buffer = vec![0; params.bufsize];
-    let mut tunnel_socket = setup_tunnel_socket(params.tunnel_addr, params.remote, params.mode, &mut buffer, TYPE_CLIENT).await;
+    let mut tunnel_socket = setup_tunnel_socket(params.tunnel_addr, params.remote, params.mode, &mut buffer, TYPE_CLIENT).await.expect("failed to setup tunnel");
     let mut cache: Cache = Cache::new(params.timeout);
-    let data_table = params.format.map(|f| output::Table::<OutputColumn>::parse_spec(f.with_default("[%d tunnel] client: %c lsock: %a dbuf: %l")).unwrap());
+    let data_output = params.format.map(|f| output::TableFormat::<OutputColumn>::parse_spec(f.with_default("[%d tunnel] client: %c lsock: %a dbuf: %l")).expect("failed to parse data log format"));
 
     loop {
         match poll_sockets(&tunnel_socket, &cache, &mut buffer[2..]).await {
@@ -67,7 +67,7 @@ pub async fn start_server<T, U, V>(params: ServerParams<'_, T, U, V>)
                                         }
                                     }
                                 };
-                                if let Some(data_table) = &data_table {
+                                if let Some(data_table) = &data_output {
                                     let info = DataPacketInfo {
                                         to_tunnel: false,
                                         client: id,
@@ -86,7 +86,7 @@ pub async fn start_server<T, U, V>(params: ServerParams<'_, T, U, V>)
                     Direction::IntoTunnel(id) => {
                         buffer[0] = PACKET_DATA;
                         buffer[1] = id.cid;
-                        if let Some(data_table) = &data_table {
+                        if let Some(data_table) = &data_output {
                             let info = DataPacketInfo {
                                 to_tunnel: true,
                                 client: id,
@@ -149,7 +149,7 @@ async fn create_socket(target: impl ToSocketAddrs, sf: &Option<SourceFormat>, mo
     let a = sf.map(|sf| sf.get_addr(ThreadRng::default())).unwrap_or_else(|| default_listen_ip(mode));
     println!("creating socket on {}", a);
     let socket = UdpSocket::bind(a).await?;
-    socket.connect(target).await.unwrap();
+    socket.connect(target).await?;
     Ok(socket)
 }
 

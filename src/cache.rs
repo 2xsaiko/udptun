@@ -97,6 +97,6 @@ impl Cache {
 
 #[derive(Error, Debug, Copy, Clone)]
 pub enum Error {
-    #[error("No free ID slots available")]
+    #[error("no free ID slots available")]
     NoFreeSlots
 }
